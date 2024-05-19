@@ -1,14 +1,14 @@
 #include <Arduino.h>
-#include <SoftwareSerial.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH1106.h>
 
 #define OLED_RESET -1
 Adafruit_SH1106 display(OLED_RESET);
 
-const byte rxPin = 2;
-const byte txPin = 3;
-SoftwareSerial mySerial(rxPin, txPin);
+// oil Pressure
+const float pressureZero = 102.4; // raw value at 0 psi 0.5v
+const float pressureMax = 921.6; // raw value at max psi 4.5v
+const int pressureTransducermaxPSI = 150;
 
 const unsigned int MAX_BUFFER_LENGTH = 10;
 const long bootAnimation = 1000;
@@ -86,114 +86,44 @@ const unsigned char* epd_bitmap_allArray[epd_bitmap_allArray_LEN] = {
 };
 bool booted = false;
 
+// Get an resistor that should be most accurate at the required temp
+float getTemperatureByPinSteinhart(int pin, double knownTemperatureResistor, double c1, double c2, double c3) {
+  double adc_raw = analogRead(pin);
+  double voltage = adc_raw / 1024.0 * 5;
 
-void drawPercentbar(int x, int y, int width, int height, int progress) {
-   progress = progress > 100 ? 100 : progress;
-   progress = progress < 0 ? 0 : progress;
+  //  GND - resistor - input pin - sensor - 5V
+  double resistance = ((5.0 * knownTemperatureResistor / voltage) - knownTemperatureResistor);
 
-   float bar = ((float)(width - 4) / 100) * progress; 
-   display.drawRect(x, y, width, height, WHITE);
-   display.fillRect(x + 2, y + 2, bar , height - 4, WHITE);
+  //  5V - resistor - input pin - sensor - GND
+  // double resistance = knownTemperatureResistor * (1 / ((5.0 / voltage) - 1));
 
-   display.fillRect(81, 52, 1, 12, WHITE);
+  double logR  = log(resistance);
+  double logR3 = logR * logR * logR;
+
+  // 9.5 is // Dissipation factor (mW/°C)
+  double steinhart = 1.0 / (c1 + c2 * logR + c3 * logR3);
+  return steinhart - voltage * voltage / (9.5 * knownTemperatureResistor) - 273.15;
 }
 
-void updateDisplay(byte* buffer) {
-  // Checksum is the total except checksum itself (last 2 values)
-  int calculatedChecksum = 0;
-  for (unsigned int i = 0; i < (MAX_BUFFER_LENGTH - 2); i++) {
-    calculatedChecksum ^= buffer[i];
+float getPressureByPin(int pin) {
+  float pressureRaw = analogRead(pin);
+  float pressureValue = ((pressureRaw - pressureZero) * pressureTransducermaxPSI) / (pressureMax - pressureZero);
+
+  // cool, now lets not get below 0, how do we handle vacuum anyway - vacuum can be in kpa
+  if (pressureValue < 0) {
+    pressureValue = 0;
   }
 
-  int receivedChecksum = buffer[MAX_BUFFER_LENGTH - 2];
-  bool checksumValid = calculatedChecksum == receivedChecksum;
-  // reject the message on checksum failure
-  // if (!checksumValid) {
-  //   return;
-  // }
-
-  float oilTemp = buffer[0];
-  float oilPressure = (float)buffer[1] / 10;
-  float lambda = (float)buffer[2];// / 100; /100 commented for the bar map
-
-  // not yet implemented
-  // float waterTemp = buffer[4];
-  // float waterPressure = (float)buffer[3] / 10;
-  // float iat = buffer[5];
-  // float intakePressure = (float)buffer[6] / 10;
-  // float xx = (float)buffer[7];
-
-  for (unsigned int i = 0; i < MAX_BUFFER_LENGTH; i++) {
-    if (buffer[i] < 0x10) {
-      Serial.print("0");
-    }
-    Serial.print(buffer[i], HEX);
-    Serial.print(" ");
+  if (pressureValue > pressureTransducermaxPSI) {
+    pressureValue = pressureTransducermaxPSI;
   }
 
-  Serial.print(":");
-  Serial.print(calculatedChecksum, HEX);
-  Serial.print(": ");
-
-  if (checksumValid) {
-    Serial.println("OK");
-  } else {
-    Serial.println("INVALID");
-  }
-
-  display.clearDisplay();
-  display.setCursor(5, 0);
-
-  // display.setTextSize(1);
-  // display.print(oilTemp);
-  // display.print(", ");
-  // display.print(oilPressure);
-  // display.print(", ");
-  // display.print(lambda);
-  // display.print(", ");
-  // display.print(waterPressure);
-  // display.print(", ");
-  // display.print(lambda);
-  // display.print(", ");
-  // display.print(iat);
-  // display.print(", ");
-  // display.print(intakePressure);
-  // display.print(", ");
-  // if (checksumValid) {
-  //   display.print(" OK");
-  // } else {
-  //   display.print(" INVALID");
-  // }
-
-  display.print(oilTemp, 1);
-  display.setCursor(90, -14);
-  display.print(".");
-  display.setCursor(105, 0);
-  display.print("C");
-
-  display.setCursor(5, 30);
-  display.print(oilPressure, 1);
-  display.setCursor(97, 30);
-  display.print("b");
-  display.setCursor(110, 30);
-  if (checksumValid) {
-    display.print(".");
-  }
-
-  // drawbar
-  lambda = map(lambda, 58, 123, 0, 100);
-  drawPercentbar(0, 54, 128, 8, lambda);
-
-  display.display();
+  // From PSI to BAR
+  return pressureValue * 0.0689475729;
 }
 
 void setup() {
   Serial.begin(115200);
-
-  // Define pin modes for TX and RX
-  pinMode(rxPin, INPUT);
-  pinMode(txPin, OUTPUT);
-  mySerial.begin(9600);
 
   display.begin(SH1106_SWITCHCAPVCC, 0x3C);
   display.setTextSize(3);
@@ -219,29 +149,23 @@ void loop() {
     booted = true;
   }
 
-  // Check to see if anything is available in the serial receive buffer
-  while (mySerial.available() > 0) {
-    // Create a place to hold the incoming message
-    static byte buffer[MAX_BUFFER_LENGTH];
-    static unsigned int buffer_pos = 0;
+  float oilTemp = getTemperatureByPinSteinhart(A0, 4700, 0.0007256952119519713, 0.00023918385992649434, 3.338981222442535e-8); // Alie new
+  float oilPressure = getPressureByPin(A1);
 
-    // Read the next available byte in the serial receive buffer
-    byte inByte = mySerial.read();
+  display.clearDisplay();
+  display.setCursor(5, 0);
 
-    if (inByte != '\n' && (buffer_pos < sizeof(buffer) - 1)) {
-      //Message coming in (check not terminating character) and guard for over message size
-      //Add the incoming byte to our message
-      buffer[buffer_pos] = inByte;
-      buffer_pos++;
-    } else {
-      //Full message received...
-      //Add null character to string
-      buffer[buffer_pos] = '\0';
+  display.print(oilTemp, 1);
+  display.setCursor(90, -14);
+  display.print(".");
+  display.setCursor(105, 0);
+  display.print("C");
 
-      updateDisplay(buffer);
+  display.setCursor(5, 30);
+  display.print(oilPressure, 1);
+  display.setCursor(97, 30);
+  display.print("b");
+  display.setCursor(110, 30);
 
-      //Reset for the next message
-      buffer_pos = 0;
-    }
-  }
+  display.display();
 }
